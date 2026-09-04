@@ -1,4 +1,4 @@
-.PHONY: prepare install update lint check test test-py test-sq test-matrix-py test-matrix-sq
+.PHONY: prepare install update lint check test test-pg test-pipeline test-graph test-enrichment test-api serve test-py test-sq test-matrix-py test-matrix-sq
 
 prepare: lint check
 
@@ -23,7 +23,46 @@ check:
 	uv run ty check
 
 test:
-	@uv run pytest -s --cov=twscrape tests/
+	@uv run pytest -s --cov=twscrape --cov=xgraph tests/
+
+# The PostgreSQL contracts (frontier claim, account leasing, schema constraints)
+# are skipped unless XGRAPH_TEST_DATABASE_URL points at a real server, so they
+# have to run as their own gate. Requires PostgreSQL 15+ for NULLS NOT DISTINCT.
+test-pg:
+	@XGRAPH_TEST_DATABASE_URL=$${XGRAPH_TEST_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test} \
+		uv run pytest -q tests/xgraph/test_postgres_integration.py
+
+# The stage 3 delivery guarantees are properties of the boundary between
+# PostgreSQL and the broker, so neither half can be faked. Without KAFKA the
+# broker round-trip is skipped and only the transactional contracts run.
+test-pipeline:
+	@XGRAPH_TEST_DATABASE_URL=$${XGRAPH_TEST_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test} \
+	 XGRAPH_TEST_KAFKA_BOOTSTRAP=$${XGRAPH_TEST_KAFKA_BOOTSTRAP:-127.0.0.1:9092} \
+		uv run pytest -q tests/xgraph/test_phase3_integration.py
+
+# The L0-L6 traversal is enforced by constraints and set-based statements that
+# a fake cannot reproduce: node uniqueness, depth assignment and layer closure
+# are all properties of the database.
+test-graph:
+	@XGRAPH_TEST_DATABASE_URL=$${XGRAPH_TEST_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test} \
+		uv run pytest -q tests/xgraph/test_phase4_integration.py
+
+# Enrichment must stay isolated from the traversal: its own rate-limit bucket,
+# its own frontier rows, no ability to hold a layer open. All three are database
+# properties.
+test-enrichment:
+	@XGRAPH_TEST_DATABASE_URL=$${XGRAPH_TEST_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test} \
+		uv run pytest -q tests/xgraph/test_phase5_integration.py
+
+# The product surface is asserted against the same fact store the pipeline
+# writes, including the rule that no route may expose scraper identities.
+test-api:
+	@XGRAPH_TEST_DATABASE_URL=$${XGRAPH_TEST_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test} \
+		uv run pytest -q tests/xgraph/test_phase6_integration.py
+
+serve:
+	@XGRAPH_DATABASE_URL=$${XGRAPH_DATABASE_URL:?set XGRAPH_DATABASE_URL} \
+		uv run python -m xgraph.api
 
 test-py:
 	$(eval name=twscrape_py$(v))

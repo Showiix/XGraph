@@ -1,4 +1,7 @@
 __pycache__/
+.venv/
+.pytest_cache/
+htmlcov/
 .coverage
 .DS_Store
 .ruff_cache/
@@ -10,3 +13,15 @@ data/
 dist/
 results-parsed/
 results-raw/
+
+# Live scraper cookies. Full account access; never committed.
+credentials.json
+credentials*.json
+.xgraph/
+scratch/
+
+# Run reports naming the real seed account and the outreach candidates it found.
+# The repository is public; these say who is being targeted, which the numbers in
+# docs/xgraph-technical-design.md do not. Kept local until that is decided.
+docs/xgraph-e2e-run-*.md
+docs/xgraph-full-run-*.md

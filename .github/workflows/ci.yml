@@ -1,9 +1,8 @@
-name: build
+name: XGraph CI
 
 on:
   push:
     branches: [main]
-    tags: ["v*"]
 
 permissions:
   contents: read
@@ -26,45 +25,89 @@ jobs:
       - run: make check
       - run: make test
 
-  release:
-    if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+  postgres:
+    name: postgres contracts
     runs-on: ubuntu-latest
-    needs: test
-    permissions:
-      contents: write
-      id-token: write
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: xgraph_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.13"
 
-      - name: Check pyproject.toml version matches tag
-        run: |
-          TAG="${{ github.ref_name }}"
-          PKG_VERSION="v$(grep '^version = ' pyproject.toml | cut -d'"' -f2)"
-          if [ "$TAG" != "$PKG_VERSION" ]; then
-            echo "Error: tag ${TAG} does not match pyproject.toml version ${PKG_VERSION}"
-            exit 1
-          fi
-
-      - name: Prepare README for PyPI
-        run: |
-          BASE_URL="https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}"
-          sed -i "s#src=\"\\.github/#src=\"${BASE_URL}/.github/#g" readme.md
-
-      - run: uv build
-
-      - name: Extract changelog entry
-        run: |
-          VERSION="${{ github.ref_name }}"
-          NOTES=$(awk "/^## ${VERSION}/{found=1; next} /^## /{found=0} found && !/^---$/" changelog.md)
-          if [ -z "$NOTES" ]; then
-            echo "Error: no changelog entry found for ${VERSION}"
-            exit 1
-          fi
-          echo "$NOTES" > release_notes.txt
-
-      - uses: pypa/gh-action-pypi-publish@release/v1
-
-      - run: gh release create ${{ github.ref_name }} --title ${{ github.ref_name }} --notes-file release_notes.txt
+      - run: uv sync --frozen
+      # The frontier and account-pool contracts only hold against a real server;
+      # a skipped run here is how a silently unleasable account pool ships.
+      - run: make test-pg
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          XGRAPH_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test
+      # Depth assignment, node/edge uniqueness and layer closure are database
+      # properties; a synthetic platform exercises them end to end.
+      - run: make test-graph
+        env:
+          XGRAPH_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test
+      - run: make test-enrichment
+        env:
+          XGRAPH_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test
+      - run: make test-api
+        env:
+          XGRAPH_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test
+\n
+  pipeline:
+    name: raw page pipeline
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: xgraph_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      kafka:
+        image: apache/kafka:3.9.0
+        ports: ["9092:9092"]
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:19092,CONTROLLER://:9093,EXTERNAL://:9092
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:19092,EXTERNAL://127.0.0.1:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+          KAFKA_NUM_PARTITIONS: 2
+          KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: "3.13"
+
+      - run: uv sync --frozen
+      # Outbox durability, redelivery idempotency and rebalance fencing are all
+      # properties of the PostgreSQL/broker boundary. Faking either half proves
+      # nothing, so both run for real here.
+      - run: make test-pipeline
+        env:
+          XGRAPH_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test
+          XGRAPH_TEST_KAFKA_BOOTSTRAP: 127.0.0.1:9092
