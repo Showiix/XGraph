@@ -285,8 +285,13 @@ class PostgresFrontierStore:
         error_class: str | None = None,
         not_before: datetime | None = None,
         refund_attempt: bool = False,
-    ) -> None:
-        """Close out a claimed work item.
+    ) -> FrontierStatus:
+        """Close out a claimed work item, and report what it actually became.
+
+        A `retryable` turn that used up the last attempt becomes `failed` here,
+        in the same statement. The caller has to be told: it believes the row
+        will come round again, so it leaves the account mid-flight — and nothing
+        ever comes back to finish it.
 
         `refund_attempt` gives back the attempt that `claim_frontier` charged.
         The retry budget exists to stop a poisoned row from being retried
@@ -304,7 +309,7 @@ class PostgresFrontierStore:
         }:
             raise ValueError("finish_frontier requires a terminal or retryable status")
         async with self._pool.acquire() as connection:
-            result = await connection.execute(
+            row = await connection.fetchrow(
                 """
                 UPDATE crawl_frontier
                 SET attempt = CASE WHEN $7 THEN GREATEST(attempt - 1, 0) ELSE attempt END,
@@ -321,7 +326,8 @@ class PostgresFrontierStore:
                     owner_id = NULL,
                     lease_expires_at = NULL,
                     updated_at = now()
-                WHERE frontier_id = $1 AND owner_id = $6;
+                WHERE frontier_id = $1 AND owner_id = $6
+                RETURNING status;
                 """,
                 item.frontier_id,
                 status.value,
@@ -331,8 +337,9 @@ class PostgresFrontierStore:
                 item.owner_id,
                 refund_attempt,
             )
-        if result == "UPDATE 0":
+        if row is None:
             raise RuntimeError("frontier lease was lost before finish")
+        return FrontierStatus(row["status"])
 
     async def fail_exhausted_frontier(self, task_id: str) -> int:
         """Move rows that used up their attempt budget to a terminal state.

@@ -133,12 +133,7 @@ class ExpansionScheduler:
             return await self._expand(item)
         except BudgetExhaustedError as error:
             # Not this account's fault; leave it claimable for the next window.
-            await self._frontier.finish_frontier(
-                item,
-                FrontierStatus.RETRYABLE,
-                error_class="budget_exhausted",
-                refund_attempt=True,
-            )
+            await self._halt(item, "budget_exhausted", refund_attempt=True)
             logger.info(f"expansion halted for {item.account_id}: {error}")
             return ExpansionResult(item.account_id, 0, TerminationReason.BUDGET_EXHAUSTED)
 
@@ -159,14 +154,13 @@ class ExpansionScheduler:
             except NoAvailableAccountError:
                 # The chain is unfinished but nothing is wrong with it; keep the
                 # cursor and let a later pass continue from the checkpoint.
-                await self._frontier.finish_frontier(
+                # Without a delay the row is immediately claimable again and
+                # every idle worker spins on it, burning CPU while the pool is
+                # the thing that is actually short.
+                await self._halt(
                     item,
-                    FrontierStatus.RETRYABLE,
-                    error_class="no_available_account",
+                    "no_available_account",
                     refund_attempt=True,
-                    # Without a delay the row is immediately claimable again and
-                    # every idle worker spins on it, burning CPU while the pool
-                    # is the thing that is actually short.
                     not_before=_in(STARVED_BACKOFF_SECONDS),
                 )
                 return ExpansionResult(item.account_id, pages, None, "no_available_account")
@@ -190,14 +184,10 @@ class ExpansionScheduler:
             except RateLimitedError as error:
                 await self._accounts.report(lease, "rate_limited", reset_at=error.reset_at)
                 await self._frontier.finish_request(attempt, outcome="rate_limited")
-                await self._frontier.finish_frontier(
-                    item,
-                    FrontierStatus.RETRYABLE,
-                    error_class="rate_limited",
-                    refund_attempt=True,
-                    # Hold the row until the window the platform named. Retrying
-                    # before then cannot succeed and only spends worker turns.
-                    not_before=error.reset_at,
+                # Hold the row until the window the platform named. Retrying
+                # before then cannot succeed and only spends worker turns.
+                await self._halt(
+                    item, "rate_limited", refund_attempt=True, not_before=error.reset_at
                 )
                 return ExpansionResult(item.account_id, pages, None, "rate_limited")
             except ACCOUNT_ERRORS as error:
@@ -205,9 +195,7 @@ class ExpansionScheduler:
                 await self._frontier.finish_request(
                     attempt, outcome="failed", error_class=_error_class(error)
                 )
-                await self._frontier.finish_frontier(
-                    item, FrontierStatus.RETRYABLE, error_class=_error_class(error)
-                )
+                await self._halt(item, _error_class(error))
                 return ExpansionResult(item.account_id, pages, None, _error_class(error))
             except TERMINAL_PAGE_ERRORS as error:
                 await self._accounts.release(lease, success=False)
@@ -222,9 +210,7 @@ class ExpansionScheduler:
                 await self._frontier.finish_request(
                     attempt, outcome="failed", error_class=_error_class(error)
                 )
-                await self._frontier.finish_frontier(
-                    item, FrontierStatus.RETRYABLE, error_class=_error_class(error)
-                )
+                await self._halt(item, _error_class(error))
                 return ExpansionResult(item.account_id, pages, None, _error_class(error))
             except CollectorError as error:
                 # Catch-all by design. An unclassified error must degrade this
@@ -234,9 +220,7 @@ class ExpansionScheduler:
                 logger.warning(f"unclassified collector error ({cls}): {error}")
                 await self._accounts.release(lease, success=False)
                 await self._frontier.finish_request(attempt, outcome="failed", error_class=cls)
-                await self._frontier.finish_frontier(
-                    item, FrontierStatus.RETRYABLE, error_class=cls, not_before=_in(30)
-                )
+                await self._halt(item, cls, not_before=_in(30))
                 return ExpansionResult(item.account_id, pages, None, cls)
             finally:
                 await collector.aclose()
@@ -278,6 +262,35 @@ class ExpansionScheduler:
                 return await self._finish(item, TerminationReason.CURSOR_STALLED, pages)
             seen_cursors.add(envelope.cursor_out)
             cursor = envelope.cursor_out
+
+    async def _halt(
+        self,
+        item: FrontierItem,
+        error_class: str,
+        *,
+        refund_attempt: bool = False,
+        not_before: datetime | None = None,
+    ) -> None:
+        """End this turn expecting another, and record it if there is not one.
+
+        The frontier turns a retryable finish into a terminal one when the
+        attempt budget runs out. Without reading that back the account is left
+        mid-expansion for good: the row is finished, nothing will claim it again,
+        and its status still says a worker is on it.
+        """
+
+        outcome = await self._frontier.finish_frontier(
+            item,
+            FrontierStatus.RETRYABLE,
+            error_class=error_class,
+            refund_attempt=refund_attempt,
+            not_before=not_before,
+        )
+        if outcome is FrontierStatus.FAILED:
+            logger.warning(
+                f"expansion for {item.account_id} exhausted its attempts on {error_class}"
+            )
+            await self._record_termination(item, TerminationReason.FAILED, failed=True)
 
     async def _finish(
         self,

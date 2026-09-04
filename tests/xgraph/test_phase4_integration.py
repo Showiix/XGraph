@@ -16,6 +16,8 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
+from xgraph.accounts.manager import NoAvailableAccountError
+from xgraph.collector.errors import TransportError
 from xgraph.collector.parser import parse_users
 from xgraph.domain import Operation, PageEnvelope, RateLimitSnapshot, UserProfile
 from xgraph.graph import GraphPageHandler, TraversalPolicy
@@ -166,6 +168,29 @@ class FakePlatform:
         )
 
     async def aclose(self) -> None:
+        return None
+
+
+class _FailingPlatform:
+    """A platform that is temporarily unreachable — retryable, and charged for."""
+
+    async def following_page(self, account_id: str, cursor: str | None = None):
+        raise TransportError("connection reset")
+
+    async def aclose(self) -> None:
+        return None
+
+
+class _NoAccounts:
+    """A pool with nothing in it, which is a normal condition, not a fault."""
+
+    async def lease(self, operation: str, **kwargs: Any) -> Any:
+        raise NoAvailableAccountError(operation)
+
+    async def release(self, lease: Any, **kwargs: Any) -> None:
+        return None
+
+    async def report(self, lease: Any, error_class: str, **kwargs: Any) -> None:
         return None
 
 
@@ -421,6 +446,47 @@ async def test_completion_requires_the_parser_to_have_caught_up(pool):
 
 
 # --- resumption, filtering, evidence ---------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_account_whose_retries_run_out_is_not_left_mid_expansion(pool):
+    """The last retryable turn is a terminal one, and the account has to be told.
+
+    `finish_frontier` converts a retryable finish into a failure when the attempt
+    budget is spent. A caller that does not read that back believes the row will
+    come round again, so it leaves the account's status describing work no worker
+    is doing — and nothing ever comes back to correct it.
+    """
+
+    platform = FakePlatform({"s": ["a"], "a": []}, page_size=5)
+    pipe = Pipeline(pool, platform)
+    await pipe.frontier.create_seed_task("t", {"tree-a": "s"})
+    await pipe.start()
+
+    async with pool.acquire() as connection:
+        await connection.execute(
+            "UPDATE crawl_frontier SET attempt = max_attempts - 1 WHERE task_id = 't'"
+        )
+
+    # A transport failure is retryable and does charge an attempt, unlike an
+    # empty pool, which refunds because the request was never sent.
+    async def failing(alias: str, /):
+        return _FailingPlatform()
+
+    pipe.scheduler._collector_factory = failing  # noqa: SLF001
+    result = await pipe.scheduler.run_once()
+    assert result is not None and result.error_class == "transport"
+
+    row = await _rows(
+        pool,
+        "SELECT f.status, n.expansion_status, n.termination_reason "
+        "FROM crawl_frontier f JOIN account_nodes n "
+        "  ON n.task_id = f.task_id AND n.account_id = f.account_id "
+        "WHERE f.task_id = 't' AND f.account_id = 's'",
+    )
+    assert row[0]["status"] == "failed", "the row used up its last attempt"
+    assert row[0]["expansion_status"] == "failed", "and the account says so too"
+    assert row[0]["termination_reason"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -719,8 +785,6 @@ class _CountingAccounts:
 
     async def lease(self, operation: str, *, owner_id: str, **kwargs):
         if self.held >= 1:
-            from xgraph.accounts.manager import NoAvailableAccountError
-
             raise NoAvailableAccountError("pool empty")
         self.held += 1
         self.max_held = max(self.max_held, self.held)
@@ -778,8 +842,6 @@ async def test_losing_the_race_for_an_account_does_not_spend_the_retry_budget(po
 
     class _EmptyPool:
         async def lease(self, operation: str, *, owner_id: str, **kwargs):
-            from xgraph.accounts.manager import NoAvailableAccountError
-
             raise NoAvailableAccountError("pool empty")
 
         async def release(self, lease, **kwargs) -> None: ...

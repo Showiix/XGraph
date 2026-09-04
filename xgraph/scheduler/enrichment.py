@@ -6,6 +6,7 @@ while enrichment is paused, behind, or switched off entirely.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from typing import Protocol
 from uuid import uuid4
@@ -109,12 +110,7 @@ class EnrichmentScheduler:
         except BudgetExhaustedError as error:
             # Enrichment shares the task budget but must not consume the
             # traversal's retry allowance; the chain simply waits.
-            await self._frontier.finish_frontier(
-                item,
-                FrontierStatus.RETRYABLE,
-                error_class="budget_exhausted",
-                refund_attempt=True,
-            )
+            await self._halt(item, "budget_exhausted", refund_attempt=True)
             logger.info(f"timeline halted for {item.account_id}: {error}")
             return EnrichmentResult(item.account_id, 0, None, "budget_exhausted")
 
@@ -150,14 +146,13 @@ class EnrichmentScheduler:
                     Operation.USER_TWEETS.value, owner_id=self._worker_id
                 )
             except NoAvailableAccountError:
-                await self._frontier.finish_frontier(
+                # Without a delay the row is immediately claimable again and
+                # every idle worker spins on it, burning CPU while the pool is
+                # the thing that is actually short.
+                await self._halt(
                     item,
-                    FrontierStatus.RETRYABLE,
-                    error_class="no_available_account",
+                    "no_available_account",
                     refund_attempt=True,
-                    # Without a delay the row is immediately claimable again and
-                    # every idle worker spins on it, burning CPU while the pool
-                    # is the thing that is actually short.
                     not_before=_in(STARVED_BACKOFF_SECONDS),
                 )
                 return EnrichmentResult(item.account_id, pages, None, "no_available_account")
@@ -181,23 +176,17 @@ class EnrichmentScheduler:
             except RateLimitedError as error:
                 await self._accounts.report(lease, "rate_limited", reset_at=error.reset_at)
                 await self._frontier.finish_request(attempt, outcome="rate_limited")
-                await self._frontier.finish_frontier(
-                    item,
-                    FrontierStatus.RETRYABLE,
-                    error_class="rate_limited",
-                    refund_attempt=True,
-                    # Hold the row until the window the platform named. Retrying
-                    # before then cannot succeed and only spends worker turns.
-                    not_before=error.reset_at,
+                # Hold the row until the window the platform named. Retrying
+                # before then cannot succeed and only spends worker turns.
+                await self._halt(
+                    item, "rate_limited", refund_attempt=True, not_before=error.reset_at
                 )
                 return EnrichmentResult(item.account_id, pages, None, "rate_limited")
             except ACCOUNT_ERRORS as error:
                 cls = _error_class(error)
                 await self._accounts.report(lease, cls)
                 await self._frontier.finish_request(attempt, outcome="failed", error_class=cls)
-                await self._frontier.finish_frontier(
-                    item, FrontierStatus.RETRYABLE, error_class=cls
-                )
+                await self._halt(item, cls)
                 return EnrichmentResult(item.account_id, pages, None, cls)
             except TERMINAL_PAGE_ERRORS as error:
                 cls = _error_class(error)
@@ -208,9 +197,7 @@ class EnrichmentScheduler:
                 cls = _error_class(error)
                 await self._accounts.release(lease, success=False)
                 await self._frontier.finish_request(attempt, outcome="failed", error_class=cls)
-                await self._frontier.finish_frontier(
-                    item, FrontierStatus.RETRYABLE, error_class=cls
-                )
+                await self._halt(item, cls)
                 return EnrichmentResult(item.account_id, pages, None, cls)
             except CollectorError as error:
                 # Catch-all by design. An unclassified error must degrade this
@@ -220,9 +207,7 @@ class EnrichmentScheduler:
                 logger.warning(f"unclassified collector error ({cls}): {error}")
                 await self._accounts.release(lease, success=False)
                 await self._frontier.finish_request(attempt, outcome="failed", error_class=cls)
-                await self._frontier.finish_frontier(
-                    item, FrontierStatus.RETRYABLE, error_class=cls, not_before=_in(30)
-                )
+                await self._halt(item, cls, not_before=_in(30))
                 return EnrichmentResult(item.account_id, pages, None, cls)
             finally:
                 await collector.aclose()
@@ -264,6 +249,37 @@ class EnrichmentScheduler:
                 return await self._finish(item, SampleOutcome.CURSOR_STALLED, pages)
             seen.add(envelope.cursor_out)
             cursor = envelope.cursor_out
+
+    async def _halt(
+        self,
+        item: FrontierItem,
+        error_class: str,
+        *,
+        refund_attempt: bool = False,
+        not_before: datetime | None = None,
+    ) -> None:
+        """End this turn expecting another, and record it if there is not one.
+
+        The frontier turns a retryable finish into a terminal one when the
+        attempt budget runs out. Without reading that back the account keeps a
+        `collecting` status no worker is backing: the row is finished, nothing
+        will claim it again, and the sample is neither complete nor retried.
+        """
+
+        outcome = await self._frontier.finish_frontier(
+            item,
+            FrontierStatus.RETRYABLE,
+            error_class=error_class,
+            refund_attempt=refund_attempt,
+            not_before=not_before,
+        )
+        if outcome is FrontierStatus.FAILED:
+            logger.warning(
+                f"timeline for {item.account_id} exhausted its attempts on {error_class}"
+            )
+            await self._timeline.set_timeline_status(
+                item.task_id, item.account_id, "failed", reason=SampleOutcome.FAILED.value
+            )
 
     async def _finish(
         self,
