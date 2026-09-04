@@ -20,6 +20,7 @@ from .errors import (
     InvalidResponseError,
     TransportError,
     blocked_error,
+    rate_limit_error,
     response_error,
 )
 from .http import HttpClient, HttpError, Response, credential_seed, format_error, make_client
@@ -241,6 +242,13 @@ class ProtocolCollector:
             raise TransportError("request did not return a response")
         if blocked := blocked_error(response.status_code, response.headers):
             raise blocked
+        # Before parsing: a throttled request comes back as `429` with a
+        # plain-text body, so classifying it from the payload never happens — the
+        # parse fails first and a normal, temporary condition is reported as a
+        # malformed response, which counts against the account until it is
+        # disabled.
+        if limited := rate_limit_error(response.status_code, response.headers):
+            raise limited
         try:
             raw_payload = response.json()
         except json.JSONDecodeError as error:

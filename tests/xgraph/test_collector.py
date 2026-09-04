@@ -327,3 +327,49 @@ def test_response_error_classification(
 def test_scraper_credential_requires_web_session_cookies() -> None:
     with pytest.raises(ValueError, match="auth_token"):
         ScraperCredential(alias="missing", cookies={"ct0": "csrf"}, user_agent="ua")
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_request_is_a_rate_limit_not_a_broken_response() -> None:
+    """X answers a throttled request with plain text, not the JSON error envelope.
+
+    Classifying it from the payload never happens: the body fails to parse first,
+    so a normal, temporary condition is reported as a malformed response and the
+    account takes the blame. Five of those in a row disable an account that was
+    working the whole time.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={
+                "content-type": "text/plain;charset=utf-8",
+                "x-rate-limit-remaining": "0",
+                "x-rate-limit-reset": "4102444800",
+            },
+            content=b"Rate limit exceeded",
+        )
+
+    client = MockHttpClient(handler)
+    collector = ProtocolCollector(credential(), client=client, signer=FixedSigner())
+    with pytest.raises(RateLimitedError) as caught:
+        await collector.following_page("123")
+    await client.aclose()
+    assert caught.value.reset_at == datetime.fromtimestamp(4102444800, timezone.utc)
+
+
+@pytest.mark.asyncio
+async def test_a_throttled_request_without_a_reset_header_still_waits() -> None:
+    """A rate limit that does not say when it lifts is still a rate limit."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429, headers={"content-type": "text/plain"}, content=b"Rate limit exceeded"
+        )
+
+    client = MockHttpClient(handler)
+    collector = ProtocolCollector(credential(), client=client, signer=FixedSigner())
+    with pytest.raises(RateLimitedError) as caught:
+        await collector.following_page("123")
+    await client.aclose()
+    assert caught.value.reset_at > datetime.now(timezone.utc)

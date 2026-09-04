@@ -1,7 +1,7 @@
 """Error classes and response classification for X Web GraphQL."""
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 
@@ -77,6 +77,35 @@ def _header_int(headers: Mapping[str, str], name: str) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+#: How long to hold an account back when X reports a rate limit without saying
+#: when it lifts. X's window is 15 minutes; waiting a full one cannot be wrong by
+#: more than one window, while guessing shorter spends the account on a request
+#: that cannot succeed.
+RATE_LIMIT_FALLBACK_SECONDS = 900
+
+
+def rate_limit_error(status_code: int, headers: Mapping[str, str]) -> "RateLimitedError | None":
+    """Classify a rate limit from status and headers alone.
+
+    X answers a throttled request with `429` and a plain-text body, not the JSON
+    error envelope. Classifying on the payload therefore never sees it: the body
+    fails to parse first and the response is reported as malformed. That is the
+    difference between "wait for the window" and "this account is broken" — five
+    of the latter disable an account that was working the whole time.
+    """
+
+    if status_code != 429 and _header_int(headers, "x-rate-limit-remaining") != 0:
+        return None
+    reset = _header_int(headers, "x-rate-limit-reset")
+    if reset is not None and reset > 0:
+        return RateLimitedError(datetime.fromtimestamp(reset, timezone.utc))
+    if status_code != 429:
+        return None
+    return RateLimitedError(
+        datetime.now(timezone.utc) + timedelta(seconds=RATE_LIMIT_FALLBACK_SECONDS)
+    )
 
 
 def response_error(
