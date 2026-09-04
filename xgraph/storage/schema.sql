@@ -58,7 +58,17 @@ CREATE TABLE IF NOT EXISTS account_nodes (
     -- complete", and it must travel with the data rather than be inferred.
     declared_following INTEGER,
     collected_following INTEGER NOT NULL DEFAULT 0,
+    -- Why the expansion chain stopped. Kept apart from the timeline's own
+    -- outcome: both answer "why did a chain end", but they are different chains,
+    -- and one column means the second writer silently destroys the first's
+    -- answer -- which is what classifies this account's coverage.
     termination_reason TEXT,
+    timeline_reason TEXT,
+    -- How many accounts inside this task follow this one. Maintained with the
+    -- edges rather than counted per query: it is the product's ranking signal,
+    -- so every listing filters and sorts on it, and computing it per row turns
+    -- a page of fifty into a scan of the whole task.
+    network_indegree INTEGER NOT NULL DEFAULT 0,
     filter_reason TEXT,
     timeline_status TEXT NOT NULL DEFAULT 'none'
         CHECK (timeline_status IN ('none', 'candidate', 'queued', 'collecting',
@@ -370,3 +380,30 @@ CREATE TABLE IF NOT EXISTS account_metrics (
     computed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (task_id, account_id)
 );
+
+-- Additive migrations for databases created before these columns existed. The
+-- CREATE TABLE statements above are all IF NOT EXISTS, so they are no-ops on an
+-- existing database and cannot introduce a column on their own.
+ALTER TABLE account_nodes ADD COLUMN IF NOT EXISTS timeline_reason TEXT;
+ALTER TABLE account_nodes ADD COLUMN IF NOT EXISTS network_indegree INTEGER NOT NULL DEFAULT 0;
+
+-- In-degree is looked up by target; the primary key leads with the source, so it
+-- cannot serve that lookup. Without this index the product's ranking signal has
+-- no index behind it at all.
+CREATE INDEX IF NOT EXISTS follow_edges_target_idx
+    ON follow_edges (task_id, target_account_id);
+
+-- Listings order by in-degree within a task. The tiebreaker and the NULLS
+-- ordering have to match the query's, or the planner sorts the whole task instead.
+CREATE INDEX IF NOT EXISTS account_nodes_indegree_idx
+    ON account_nodes (task_id, network_indegree DESC NULLS LAST, account_id);
+
+-- Discovery paths are read per account. The unique constraint leads with
+-- (task_id, tree_id), so it cannot serve that lookup, and every listed row falls
+-- back to a sequential scan of every observation in the database.
+CREATE INDEX IF NOT EXISTS account_observations_account_idx
+    ON account_observations (task_id, account_id);
+
+-- Same shape on the edge side: the primary key leads with the tree.
+CREATE INDEX IF NOT EXISTS follow_edge_observations_edge_idx
+    ON follow_edge_observations (task_id, source_account_id, target_account_id);

@@ -143,6 +143,18 @@ async def _fixture(c: Any) -> None:
             td,
             source == "seed2",
         )
+    # Mirrors what `insert_edges` maintains alongside the edge. Setting the rows
+    # without it would leave the fixture describing a graph production never
+    # produces, and the listing would rank on a column that is zero everywhere.
+    await c.execute(
+        """
+        UPDATE account_nodes AS n
+        SET network_indegree = (SELECT count(*) FROM follow_edges e
+                                WHERE e.task_id = n.task_id
+                                  AND e.target_account_id = n.account_id)
+        WHERE n.task_id = 't';
+        """
+    )
     # `hub` is reached from both trees: the second is a collision.
     for tree, collision in (("tree-a", False), ("tree-b", True)):
         await c.execute(

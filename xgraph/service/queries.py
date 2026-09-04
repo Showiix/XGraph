@@ -65,7 +65,7 @@ class AccountFilter:
     offset: int = 0
 
     ORDERABLE = {
-        "network_indegree": "network_indegree",
+        "network_indegree": "n.network_indegree",
         "followers": "p.followers_count",
         "depth": "n.first_depth",
         "avg_like": "m.avg_like",
@@ -169,11 +169,6 @@ FROM account_nodes AS n
 LEFT JOIN account_profiles AS p ON p.task_id = n.task_id AND p.account_id = n.account_id
 LEFT JOIN account_metrics AS m ON m.task_id = n.task_id AND m.account_id = n.account_id
 LEFT JOIN LATERAL (
-    SELECT count(*) AS network_indegree
-    FROM follow_edges e
-    WHERE e.task_id = n.task_id AND e.target_account_id = n.account_id
-) AS d ON true
-LEFT JOIN LATERAL (
     SELECT count(DISTINCT o.tree_id) AS tree_count,
            count(*) AS observation_count,
            count(*) FILTER (WHERE o.is_collision) AS collision_count,
@@ -196,7 +191,7 @@ WHERE n.task_id = $1
   AND ($10::bool IS NULL OR COALESCE(p.protected, false) = $10)
   AND ($11::int IS NULL OR p.followers_count >= $11)
   AND ($12::int IS NULL OR p.followers_count <= $12)
-  AND ($13::int IS NULL OR COALESCE(d.network_indegree, 0) >= $13)
+  AND ($13::int IS NULL OR n.network_indegree >= $13)
   AND ($14::bool IS NULL OR (m.account_id IS NOT NULL) = $14)
   AND (NOT $15::bool OR n.expansion_status IN ('failed', 'filtered')
        OR (n.declared_following > 0 AND n.collected_following < n.declared_following))
@@ -236,12 +231,13 @@ class ProductQueries:
                 f"""
                 SELECT n.account_id, n.first_depth, n.is_l6_boundary, n.expansion_status,
                        n.declared_following, n.collected_following, n.termination_reason,
+                       n.timeline_reason,
                        n.filter_reason, n.timeline_status, n.candidate_reasons,
                        n.first_seen_at, n.updated_at,
                        p.username, p.display_name, p.description, p.followers_count,
                        p.following_count, p.protected, p.verified, p.blue_verified,
                        p.can_dm, p.location,
-                       COALESCE(d.network_indegree, 0) AS network_indegree,
+                       n.network_indegree,
                        COALESCE(obs.tree_count, 0) AS tree_count,
                        COALESCE(obs.observation_count, 0) AS observation_count,
                        COALESCE(obs.collision_count, 0) AS collision_count,
@@ -418,12 +414,8 @@ class ProductQueries:
                     """
                     SELECT n.account_id, n.first_depth AS hop
                     FROM account_nodes n
-                    LEFT JOIN LATERAL (
-                        SELECT count(*) AS indegree FROM follow_edges e
-                        WHERE e.task_id = n.task_id AND e.target_account_id = n.account_id
-                    ) d ON true
                     WHERE n.task_id = $1
-                      AND ($2::int IS NULL OR COALESCE(d.indegree, 0) >= $2);
+                      AND ($2::int IS NULL OR n.network_indegree >= $2);
                     """,
                     task_id,
                     min_network_indegree,

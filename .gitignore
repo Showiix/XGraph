@@ -16,7 +16,7 @@ results-raw/
 
 # Live scraper cookies. Full account access; never committed.
 credentials.json
-credentials*.json
+credentials*
 .xgraph/
 scratch/
 

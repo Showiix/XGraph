@@ -424,6 +424,39 @@ async def test_completion_requires_the_parser_to_have_caught_up(pool):
 
 
 @pytest.mark.asyncio
+async def test_a_killed_worker_does_not_hold_its_layer_open_forever(pool):
+    """Exit gate: a request attempt outlives the worker that started it.
+
+    The frontier row is reclaimed by its lease expiring. Nothing reclaims the
+    attempt row, so a worker killed mid-request leaves it at 'started' — and a
+    layer that counts it waits on a request no process is making.
+    """
+
+    platform = FakePlatform({"s": ["a", "b"], "a": [], "b": []}, page_size=5)
+    pipe = Pipeline(pool, platform)
+    await pipe.frontier.create_seed_task("t", {"tree-a": "s"})
+    await pipe.start()
+    await pipe.drain_layer()
+
+    async with pool.acquire() as connection:
+        frontier_id = await connection.fetchval(
+            "SELECT frontier_id FROM crawl_frontier WHERE task_id='t' AND account_id='s'"
+        )
+        # Exactly what a `kill -9` mid-request leaves behind.
+        await connection.execute(
+            "INSERT INTO request_attempts (task_id, frontier_id, scraper_alias, operation, "
+            "outcome) VALUES ('t', $1, 'scraper-a', 'Following', 'started')",
+            frontier_id,
+        )
+
+    state = await pipe.layers.layer_state("t")
+    assert state.in_flight_requests == 0, (
+        "the claim that started this attempt is finished, so no worker is making it"
+    )
+    assert state.closed and not state.blocked_by
+
+
+@pytest.mark.asyncio
 async def test_an_interrupted_chain_resumes_from_its_checkpoint(pool):
     """Exit gate: killing the scheduler mid-chain must not refetch or lose pages."""
 
@@ -533,6 +566,67 @@ async def test_coverage_and_termination_are_stored_rather_than_inferred(pool):
     assert coverage["scan_capped"] == 0
     assert coverage["mean_coverage_ratio"] == pytest.approx(1.0)
     assert coverage["termination_reasons"]["empty_pages"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_a_second_consumer_group_replaying_the_topic_does_not_inflate_counts(pool):
+    """The graph must survive being interpreted twice.
+
+    Replay is the whole point of the outbox: bytes land once, interpretation can
+    be redone. Edges survive it because a row states a fact and a unique
+    constraint makes it once-only. A counter states that an event happened, and
+    adding it again says something different — silently, since nothing compares
+    the counter to the edges it claims to summarise.
+    """
+
+    platform = FakePlatform({"s": ["a", "b", "c"], **{k: [] for k in "abc"}}, page_size=2)
+    pipe = Pipeline(pool, platform)
+    await pipe.frontier.create_seed_task("t", {"tree-a": "s"})
+    await pipe.run("t")
+
+    async def snapshot() -> dict[str, tuple[int, int, int]]:
+        rows = await _rows(
+            pool,
+            "SELECT account_id, collected_following, network_indegree, "
+            "(SELECT count(*) FROM follow_edges e WHERE e.task_id = 't' "
+            " AND e.source_account_id = account_id) AS edges "
+            "FROM account_nodes WHERE task_id = 't' ORDER BY account_id",
+        )
+        return {
+            r["account_id"]: (r["collected_following"], r["network_indegree"], r["edges"])
+            for r in rows
+        }
+
+    before = await snapshot()
+    assert before["s"][0] == before["s"][2] == 3, "the counter agrees with the edge table"
+
+    # The materialised in-degree is the product's ranking signal; a stale one is
+    # a wrong answer that looks like a right one.
+    indegrees = await _rows(
+        pool,
+        "SELECT n.account_id, n.network_indegree, "
+        "(SELECT count(*) FROM follow_edges e WHERE e.task_id='t' "
+        " AND e.target_account_id = n.account_id) AS actual "
+        "FROM account_nodes n WHERE n.task_id='t' ORDER BY n.account_id",
+    )
+    assert [r["network_indegree"] for r in indegrees] == [r["actual"] for r in indegrees]
+    assert sum(r["actual"] for r in indegrees) == 3, "and it is not trivially all zero"
+
+    # A different group with its own offsets sees the whole topic from the start:
+    # a reparse worker, a second deployment, anything that is not the group that
+    # already read it.
+    replay = ParserRuntime(pipe.events, pipe.handler, group_id="second-group")
+    consumer = pipe.broker.consumer(topics=[RAW_TOPIC], on_assign=replay.on_assign)
+    replay.attach(consumer)
+    await consumer.start()
+    applied = 0
+    for message in await consumer.poll(max_records=1000):
+        if await replay.handle(message) == "applied":
+            applied += 1
+        consumer.advance(message)
+    assert applied > 0, "the second group really did re-apply every page"
+
+    assert await snapshot() == before, "re-interpreting the same pages changed the graph's numbers"
 
 
 @pytest.mark.asyncio

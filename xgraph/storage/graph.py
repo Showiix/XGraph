@@ -167,6 +167,22 @@ async def insert_edges(
         depths,
         boundary_depth,
     )
+    if rows:
+        # Maintained from the rows the insert actually created, so a replayed page
+        # adds nothing: the unique constraint is what makes this idempotent, the
+        # same guarantee `collected_following` relies on.
+        await connection.execute(
+            """
+            UPDATE account_nodes AS n
+            SET network_indegree = n.network_indegree + c.n, updated_at = now()
+            FROM (SELECT target_id, count(*) AS n
+                  FROM unnest($2::text[]) AS target_id GROUP BY target_id) AS c
+            WHERE n.task_id = $1 AND n.account_id = c.target_id;
+            """,
+            task_id,
+            [r["target_account_id"] for r in rows],
+        )
+
     if tree_id is not None:
         await connection.execute(
             """

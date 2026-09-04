@@ -43,6 +43,7 @@ ACCOUNT_COLUMNS = (
     "collected_following",
     "coverage_ratio",
     "termination_reason",
+    "timeline_reason",
     "is_l6_boundary",
     "timeline_status",
     "candidate_reasons",

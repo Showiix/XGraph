@@ -14,11 +14,18 @@ from urllib.parse import urlparse
 from xgraph.accounts import ScraperCredential
 from xgraph.domain import Operation, PageEnvelope, RateLimitSnapshot, TweetRecord, UserProfile
 
-from .errors import InvalidResponseError, TransportError, blocked_error, response_error
+from .errors import (
+    AuthenticationError,
+    FeaturesOutdatedError,
+    InvalidResponseError,
+    TransportError,
+    blocked_error,
+    response_error,
+)
 from .http import HttpClient, HttpError, Response, credential_seed, format_error, make_client
 from .operations import USER_LOOKUP_FEATURES, encode_params, operation_url
 from .parser import parse_bottom_cursor, parse_single_user, parse_tweets, parse_users
-from .xclid import XClIdGen
+from .xclid import XClIdAccountError, XClIdError, XClIdGen, XClIdParseError
 
 #: Per-request timeout. The two backends disagree on their defaults (httpx 5s,
 #: curl-cffi 30s), and a 5s ceiling produces spurious failures on slow egress,
@@ -42,12 +49,27 @@ class XWebTransactionIdSigner:
 
     async def generate(self, method: str, path: str, *, refresh: bool = False) -> str:
         if self._generator is None or refresh:
-            self._generator = await XClIdGen.create(
-                proxy=self._credential.proxy,
-                cookies=dict(self._credential.cookies),
-                user_agent=self._credential.user_agent,
-                seed=credential_seed(self._credential.alias),
-            )
+            try:
+                self._generator = await XClIdGen.create(
+                    proxy=self._credential.proxy,
+                    cookies=dict(self._credential.cookies),
+                    user_agent=self._credential.user_agent,
+                    seed=credential_seed(self._credential.alias),
+                )
+            except XClIdAccountError as error:
+                # The signer bootstraps by loading x.com as this account; a
+                # logged-out page means the session is dead. Translated here
+                # because the collector's contract is that it raises
+                # CollectorError, and callers classify on that hierarchy: an
+                # escapee is not merely unhandled, it takes down every worker
+                # sharing the task group.
+                raise AuthenticationError(str(error)) from error
+            except XClIdParseError as error:
+                # X changed the page the signer reads. Structural, like an
+                # outdated feature set: retrying cannot help.
+                raise FeaturesOutdatedError(str(error)) from error
+            except XClIdError as error:
+                raise InvalidResponseError(str(error)) from error
         return self._generator.calc(method, path)
 
 

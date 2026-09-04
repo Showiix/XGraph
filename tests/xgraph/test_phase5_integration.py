@@ -455,10 +455,10 @@ async def test_the_sample_stops_at_the_target_and_records_its_span(pool):
     assert metrics.latest_post_at == NOW
 
     result_status = await _one(
-        pool, "SELECT timeline_status, termination_reason FROM account_nodes WHERE account_id='a'"
+        pool, "SELECT timeline_status, timeline_reason FROM account_nodes WHERE account_id='a'"
     )
     assert result_status["timeline_status"] == "complete"
-    assert result_status["termination_reason"] == SampleOutcome.TARGET_REACHED.value
+    assert result_status["timeline_reason"] == SampleOutcome.TARGET_REACHED.value
 
 
 @pytest.mark.asyncio
@@ -475,8 +475,8 @@ async def test_a_short_sample_records_what_it_actually_found(pool):
 
     metrics = await store.metrics("t", "a")
     assert metrics is not None and metrics.sample_count == 1
-    row = await _one(pool, "SELECT termination_reason FROM account_nodes WHERE account_id='a'")
-    assert row["termination_reason"] == SampleOutcome.NATURAL_END.value
+    row = await _one(pool, "SELECT timeline_reason FROM account_nodes WHERE account_id='a'")
+    assert row["timeline_reason"] == SampleOutcome.NATURAL_END.value
 
 
 @pytest.mark.asyncio
@@ -496,9 +496,46 @@ async def test_scanning_stops_at_the_budget_when_qualifying_posts_are_rare(pool)
     await rig.start()
     await rig.drain()
 
-    row = await _one(pool, "SELECT termination_reason FROM account_nodes WHERE account_id='a'")
-    assert row["termination_reason"] == SampleOutcome.SCAN_LIMIT.value
+    row = await _one(pool, "SELECT timeline_reason FROM account_nodes WHERE account_id='a'")
+    assert row["timeline_reason"] == SampleOutcome.SCAN_LIMIT.value
     assert len(rig.platform.requests) <= 5, "the scan budget bounded the requests"
+
+
+@pytest.mark.asyncio
+async def test_the_timeline_outcome_does_not_overwrite_the_expansion_outcome(pool):
+    """Two chains end for their own reasons; one column would keep only the last.
+
+    The expansion reason is what classifies an account's follow coverage, so a
+    timeline outcome landing on it does not merely lose a label — it removes the
+    account from both sides of the coverage figure.
+    """
+
+    entries = [tweet_entry(f"p{i}", "a", age_days=i) for i in range(12)]
+    await seed_graph(pool, {"a": {}})
+    store = PostgresTimelineStore(pool)
+    await store.select_candidates("t", CandidatePolicy())
+    async with pool.acquire() as connection:
+        await connection.execute(
+            "UPDATE account_nodes SET expansion_status='complete', "
+            "termination_reason='page_limit', declared_following=900, "
+            "collected_following=800 WHERE task_id='t' AND account_id='a'"
+        )
+
+    rig = Rig(
+        pool, FakeTimeline({"a": entries}, page_size=3), policy=TimelinePolicy(target_posts=5)
+    )
+    await rig.start()
+    await rig.drain()
+
+    row = await _one(
+        pool,
+        "SELECT termination_reason, timeline_reason FROM account_nodes WHERE account_id='a'",
+    )
+    assert row["termination_reason"] == "page_limit", "the expansion's answer survived"
+    assert row["timeline_reason"] == SampleOutcome.TARGET_REACHED.value
+
+    coverage = await PostgresLayerStore(pool).coverage("t")
+    assert coverage["scan_capped"] == 1, "and the account is still classified by it"
 
 
 # --- isolation from the traversal ------------------------------------------

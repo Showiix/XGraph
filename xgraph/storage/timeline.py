@@ -289,7 +289,11 @@ class PostgresTimelineStore:
                 """
                 UPDATE account_nodes
                 SET timeline_status = $3,
-                    termination_reason = COALESCE($4, termination_reason),
+                    -- Its own column. Sharing `termination_reason` with the
+                    -- expansion chain let a timeline outcome overwrite the fact
+                    -- that classifies the account's follow coverage, and the two
+                    -- writers never knew about each other.
+                    timeline_reason = COALESCE($4, timeline_reason),
                     updated_at = now()
                 WHERE task_id = $1 AND account_id = $2;
                 """,

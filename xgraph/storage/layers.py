@@ -99,7 +99,15 @@ class PostgresLayerStore:
                     (SELECT count(*) FROM request_attempts a
                       JOIN crawl_frontier f ON f.frontier_id = a.frontier_id
                       WHERE a.task_id = t.task_id AND f.depth = t.depth
-                        AND f.operation = $4 AND a.outcome = 'started') AS in_flight,
+                        AND f.operation = $4 AND a.outcome = 'started'
+                        -- An attempt belongs to a claim. A killed worker leaves
+                        -- its attempt at 'started' forever, and nothing reclaims
+                        -- that row the way an expired lease reclaims the frontier
+                        -- row, so counting it would hold the layer open for good.
+                        -- The claim's liveness is what says a request can still
+                        -- be in flight.
+                        AND f.status = 'running'
+                        AND f.lease_expires_at > now()) AS in_flight,
                     (SELECT count(*) FROM raw_page_outbox o
                       WHERE o.task_id = t.task_id AND o.depth = t.depth
                         AND o.operation = $4

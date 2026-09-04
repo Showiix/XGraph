@@ -118,8 +118,15 @@ class GraphPageHandler:
             account_ids=split.filtered,
             reason="below_follower_threshold",
         )
+        # Counted from the edges this page actually inserted, not from the rows it
+        # contained. The two are equal on a first pass and differ on every replay:
+        # the unique constraint makes the insert happen exactly once ever, while a
+        # page can be interpreted any number of times by any number of consumer
+        # groups. Adding the page's row count instead inflates this silently — and
+        # nothing cross-checks it against the edge table, so the drift is invisible
+        # until a coverage ratio comes back above 1.
         await writes.add_collected(
-            connection, task_id=task_id, account_id=source_id, collected=len(discovered)
+            connection, task_id=task_id, account_id=source_id, collected=new_edges
         )
 
         new_nodes = sum(1 for t in targets if t.inserted)
