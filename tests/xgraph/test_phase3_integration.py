@@ -432,6 +432,59 @@ async def test_pages_survive_a_round_trip_through_kafka(pool, task):
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+@pytest.mark.skipif(not KAFKA, reason="XGRAPH_TEST_KAFKA_BOOTSTRAP is not configured")
+async def test_a_stored_offset_past_the_log_end_does_not_hang_the_consumer(pool, task):
+    """The offsets outlive the log they point into.
+
+    Retention deletes the segment under an offset; a rebuilt topic starts over at
+    zero while the stored offset stays high. Seeking outside the log raises
+    nothing — the consumer just waits for records that never arrive, and the
+    layer stays blocked on unparsed pages with nothing to say why.
+    """
+
+    from xgraph.messaging.kafka import KafkaConsumer, KafkaProducer
+
+    store = PostgresEventStore(pool)
+    await store.record_page(event("beyond-1"))
+    producer = KafkaProducer(str(KAFKA))
+    await producer.start()
+    try:
+        assert (await OutboxPublisher(store, producer).run_once()).published == 1
+    finally:
+        await producer.stop()
+
+    group = reparse_group(1, f"beyond-{os.getpid()}")
+    async with pool.acquire() as connection:
+        await connection.executemany(
+            "INSERT INTO consumer_offsets (group_id, topic, partition, committed_offset, "
+            "owner_id, assignment_epoch) VALUES ($1, $2, $3, $4, 'stale', 1)",
+            [(group, RAW_TOPIC, partition, 10_000_000) for partition in range(2)],
+        )
+
+    handler = RecordingHandler()
+    runtime = ParserRuntime(store, handler, group_id=group)
+    consumer = KafkaConsumer(
+        str(KAFKA), group_id=group, topics=[RAW_TOPIC], on_assign=runtime.on_assign
+    )
+    runtime.attach(consumer)
+    await consumer.start()
+    try:
+        # The assertion is delivery, not position: parking at the log's end also
+        # leaves a plausible-looking offset while dropping every page in it.
+        seen: list[Message] = []
+        for _ in range(20):
+            seen = [m for m in await consumer.poll(timeout_ms=1000) if b"beyond-1" in m.value]
+            if seen:
+                break
+        assert seen, "the page was never delivered; the consumer was parked outside the log"
+        assert await runtime.handle(seen[0]) == "applied"
+    finally:
+        await consumer.stop()
+
+    assert handler.calls == ["beyond-1"]
+
+
 async def test_a_replayed_event_for_a_deleted_task_does_not_stop_the_stream(pool, task):
     """The raw stream outlives the tasks that produced it.
 

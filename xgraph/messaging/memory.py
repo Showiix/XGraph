@@ -9,7 +9,7 @@ import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from .broker import AssignmentHandler, Message, TopicPartition
+from .broker import AssignmentHandler, LogBounds, Message, TopicPartition
 
 
 @dataclass
@@ -33,6 +33,10 @@ class InMemoryBroker:
 
     def partition_index(self, key: str | None) -> int:
         return 0 if key is None else hash(key) % self.partitions
+
+    def end_offset(self, topic: str, index: int) -> int:
+        partition = self._topics.get(topic, {}).get(index)
+        return len(partition.messages) if partition is not None else 0
 
     def messages(self, topic: str) -> list[Message]:
         parts = self._topics.get(topic, {})
@@ -109,7 +113,10 @@ class InMemoryConsumer:
         self.assigned = list(partitions)
         committed: dict[TopicPartition, int] = {}
         if self._on_assign is not None:
-            committed = await self._on_assign(self.assigned)
+            # An in-memory log is created with the consumer and never rebuilt
+            # underneath the stored offsets, so its bounds carry no information.
+            bounds: LogBounds = {tp: (0, self._broker.end_offset(*tp)) for tp in self.assigned}
+            committed = await self._on_assign(self.assigned, bounds)
         for tp in self.assigned:
             self._positions[tp] = committed.get(tp, -1) + 1
 

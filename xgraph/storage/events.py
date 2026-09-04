@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
+from loguru import logger
+
 from xgraph.domain import Operation
 
 
@@ -297,15 +299,29 @@ class PostgresEventStore:
     # --- consumer side -------------------------------------------------
 
     async def acquire_partitions(
-        self, *, group_id: str, owner_id: str, partitions: list[tuple[str, int]]
+        self,
+        *,
+        group_id: str,
+        owner_id: str,
+        partitions: list[tuple[str, int]],
+        bounds: dict[tuple[str, int], tuple[int, int]] | None = None,
     ) -> dict[tuple[str, int], int]:
         """Take ownership of partitions and return the offsets to resume from.
 
         Bumping `assignment_epoch` here is what fences the previous owner: it
         may still be mid-batch, but every write it attempts carries the old
         epoch and will match zero rows.
+
+        `bounds` is the log's real range. These offsets outlive the log they
+        point into — a rebuilt topic starts over at zero while the stored offset
+        stays high — and an offset above the log's end rejects every real record
+        as an already-seen redelivery, stalling the group permanently and
+        silently. Such an offset describes a log that no longer exists, so it is
+        discarded and the partition replayed; `processed_events` is keyed by
+        event id, which is what makes replaying cheap rather than dangerous.
         """
 
+        bounds = bounds or {}
         resumed: dict[tuple[str, int], int] = {}
         async with self._pool.acquire() as connection, connection.transaction():
             for topic, partition in partitions:
@@ -325,7 +341,23 @@ class PostgresEventStore:
                     partition,
                     owner_id,
                 )
-                resumed[(topic, partition)] = int(row["committed_offset"])
+                committed = int(row["committed_offset"])
+                _, end = bounds.get((topic, partition), (0, None))
+                if end is not None and committed > end:
+                    logger.warning(
+                        f"{group_id} {topic}/{partition}: stored offset {committed} is past "
+                        f"the log's end {end}; the topic was rebuilt or replaced, "
+                        "replaying the partition from the beginning"
+                    )
+                    committed = -1
+                    await connection.execute(
+                        "UPDATE consumer_offsets SET committed_offset = -1, updated_at = now() "
+                        "WHERE group_id = $1 AND topic = $2 AND partition = $3",
+                        group_id,
+                        topic,
+                        partition,
+                    )
+                resumed[(topic, partition)] = committed
                 self._epochs[(group_id, topic, partition)] = int(row["assignment_epoch"])
         return resumed
 

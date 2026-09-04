@@ -188,7 +188,8 @@ async def test_in_memory_consumer_resumes_from_the_offsets_it_is_handed() -> Non
     for i in range(3):
         await producer.send(RAW_TOPIC, key=None, value=f"m{i}".encode())
 
-    async def on_assign(partitions):
+    async def on_assign(partitions, bounds):
+        assert bounds == {(RAW_TOPIC, 0): (0, 3)}, "the handler is told the log's real range"
         return dict.fromkeys(partitions, 0)  # offset 0 already handled
 
     consumer = broker.consumer(topics=[RAW_TOPIC], on_assign=on_assign)

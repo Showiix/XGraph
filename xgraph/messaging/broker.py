@@ -22,10 +22,17 @@ class Message:
 #: (topic, partition)
 TopicPartition = tuple[str, int]
 
+#: The first and last offset the broker still holds for a partition. The
+#: committed offsets live in PostgreSQL and therefore outlive the log they point
+#: into, so the handler is given the log's real range to reconcile against.
+LogBounds = dict[TopicPartition, tuple[int, int]]
+
 #: Called when partitions are assigned. Returns the offset already committed for
 #: each partition; the consumer resumes from the next one. This is where the
 #: runtime takes ownership of a partition and invalidates the previous owner.
-AssignmentHandler = Callable[[Sequence[TopicPartition]], Awaitable[dict[TopicPartition, int]]]
+AssignmentHandler = Callable[
+    [Sequence[TopicPartition], LogBounds], Awaitable[dict[TopicPartition, int]]
+]
 
 
 class Producer(Protocol):

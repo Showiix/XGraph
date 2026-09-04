@@ -13,7 +13,7 @@ from xgraph.storage.events import (
     UnknownTaskError,
 )
 
-from .broker import Consumer, Message, Producer, TopicPartition
+from .broker import Consumer, LogBounds, Message, Producer, TopicPartition
 from .events import RawPageEvent
 from .topics import DLQ_TOPIC, PARSER_GROUP
 
@@ -91,11 +91,16 @@ class ParserRuntime:
 
         self._consumer = consumer
 
-    async def on_assign(self, partitions: Sequence[TopicPartition]) -> dict[TopicPartition, int]:
+    async def on_assign(
+        self, partitions: Sequence[TopicPartition], bounds: LogBounds | None = None
+    ) -> dict[TopicPartition, int]:
         """Assignment callback: claim the partitions and report where to resume."""
 
         committed = await self._store.acquire_partitions(
-            group_id=self._group_id, owner_id=self._owner_id, partitions=list(partitions)
+            group_id=self._group_id,
+            owner_id=self._owner_id,
+            partitions=list(partitions),
+            bounds=bounds or {},
         )
         logger.debug(f"{self._owner_id} took {len(committed)} partition(s) for {self._group_id}")
         return committed

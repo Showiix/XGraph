@@ -13,7 +13,7 @@ from typing import Any
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRebalanceListener
 from loguru import logger
 
-from .broker import AssignmentHandler, Message, TopicPartition
+from .broker import AssignmentHandler, LogBounds, Message, TopicPartition
 
 
 class KafkaProducer:
@@ -112,7 +112,18 @@ class KafkaConsumer:
         if self._on_assign is None:
             return
         keys: list[TopicPartition] = [(tp.topic, tp.partition) for tp in assigned]
-        committed = await self._on_assign(keys)
+        # The committed offsets live in PostgreSQL, so they outlive the log they
+        # point into: retention deletes the segment under one, and a rebuilt topic
+        # starts over at zero while the stored offset stays high. Seeking outside
+        # the log raises nothing — the consumer simply waits for records that never
+        # arrive — so the handler is given the real range to reconcile against.
+        first = await self._consumer.beginning_offsets(list(assigned))
+        last = await self._consumer.end_offsets(list(assigned))
+        bounds: LogBounds = {
+            (tp.topic, tp.partition): (int(first.get(tp, 0)), int(last.get(tp, 0)))
+            for tp in assigned
+        }
+        committed = await self._on_assign(keys, bounds)
         for tp in assigned:
             offset = committed.get((tp.topic, tp.partition), -1)
             if offset < 0:
@@ -120,8 +131,9 @@ class KafkaConsumer:
                 # than at the head, or the backlog produced before this consumer
                 # existed would never be parsed.
                 await self._consumer.seek_to_beginning(tp)
-            else:
-                self._consumer.seek(tp, offset + 1)
+                continue
+            low = bounds[(tp.topic, tp.partition)][0]
+            self._consumer.seek(tp, max(offset + 1, low))
         logger.debug(f"resumed {len(keys)} partition(s) from database offsets")
 
 

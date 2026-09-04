@@ -6,7 +6,14 @@ the outbox they can be re-interpreted any number of times for free. Everything
 here exists to make that boundary hold across crashes on either side.
 """
 
-from .broker import AssignmentHandler, Consumer, Message, Producer, TopicPartition
+from .broker import (
+    AssignmentHandler,
+    Consumer,
+    LogBounds,
+    Message,
+    Producer,
+    TopicPartition,
+)
 from .consumer import ConsumeResult, PageHandler, ParserRuntime, PermanentEventError
 from .events import SCHEMA_VERSION, RawPageEvent
 from .memory import InMemoryBroker, InMemoryConsumer, InMemoryProducer
@@ -29,6 +36,7 @@ __all__ = [
     "RAW_TOPIC",
     "SCHEMA_VERSION",
     "AssignmentHandler",
+    "LogBounds",
     "ConsumeResult",
     "Consumer",
     "InMemoryBroker",
