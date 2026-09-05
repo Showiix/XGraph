@@ -262,6 +262,30 @@ class ProductQueries:
             offset=f.offset,
         )
 
+    async def account_ids(self, task_id: str, f: AccountFilter, *, cap: int) -> list[str]:
+        """Just the ids the filter selects, up to `cap`.
+
+        Selection that feeds an algorithm is not a page: a greedy cover over the
+        first fifty rows is a cover of the first fifty rows. The filter stays the
+        same so the caller reasons about one set, but the bound is the algorithm's,
+        not the reader's.
+        """
+
+        args = self._account_args(task_id, f)
+        async with self._pool.acquire() as connection:
+            rows = await connection.fetch(
+                f"""
+                SELECT n.account_id
+                {_ACCOUNT_BASE}
+                ORDER BY {f.ORDERABLE[f.order_by]} {"DESC" if f.descending else "ASC"}
+                    NULLS LAST, n.account_id
+                LIMIT ${len(args) + 1};
+                """,
+                *args,
+                cap,
+            )
+        return [str(row["account_id"]) for row in rows]
+
     async def account_detail(self, task_id: str, account_id: str) -> dict[str, Any] | None:
         page = await self.accounts(
             task_id, AccountFilter(search=account_id, limit=1, order_by="account_id")

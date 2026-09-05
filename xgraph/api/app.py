@@ -10,6 +10,7 @@ operational detail into an externally visible one.
 """
 
 from contextlib import asynccontextmanager
+from dataclasses import asdict
 from typing import Annotated, Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -23,6 +24,7 @@ from xgraph.service.export import (
     to_csv,
     to_json,
 )
+from xgraph.service.outreach import MAX_CANDIDATE_POOL, OutreachQueries
 from xgraph.service.queries import (
     MAX_PAGE_SIZE,
     AccountFilter,
@@ -57,8 +59,12 @@ def create_app(dsn: str | None = None, pool: Any = None) -> FastAPI:
     def tasks(request: Request) -> TaskService:
         return TaskService(request.app.state.pool)
 
+    def outreach(request: Request) -> OutreachQueries:
+        return OutreachQueries(request.app.state.pool)
+
     Queries = Annotated[ProductQueries, Depends(queries)]
     Tasks = Annotated[TaskService, Depends(tasks)]
+    Outreach = Annotated[OutreachQueries, Depends(outreach)]
 
     # --- task control ---------------------------------------------------
 
@@ -164,6 +170,74 @@ def create_app(dsn: str | None = None, pool: Any = None) -> FastAPI:
         if detail is None:
             raise HTTPException(404, f"unknown account {account_id}")
         return detail
+
+    @app.get("/api/tasks/{task_id}/outreach/plan")
+    async def outreach_plan(
+        task_id: str,
+        service: Queries,
+        outreach: Outreach,
+        picks: Annotated[int, Query(ge=1, le=100)] = 20,
+        pool_size: Annotated[int, Query(ge=1, le=MAX_CANDIDATE_POOL)] = 1000,
+        search: str | None = None,
+        depth: Annotated[list[int] | None, Query()] = None,
+        tree: Annotated[list[str] | None, Query()] = None,
+        seeds_only: bool = False,
+        boundary_only: bool = False,
+        collisions_only: bool = False,
+        can_dm: bool | None = True,
+        verified: bool | None = None,
+        protected: bool | None = None,
+        min_followers: int | None = None,
+        max_followers: int | None = None,
+        min_network_indegree: int | None = None,
+        has_timeline: bool | None = None,
+        incomplete_only: bool = False,
+        order_by: str = "network_indegree",
+        descending: bool = True,
+    ) -> dict[str, Any]:
+        """Order the matching accounts so each pick reaches people the others do not.
+
+        The order is computed over the filtered set, not the whole task: the best
+        accounts to contact among everyone are not the best among the ones you can
+        actually message.
+        """
+
+        scope = dict(locals(), limit=1, offset=0)
+        f = _account_filter(scope)
+        ids = await service.account_ids(task_id, f, cap=pool_size)
+        plan = await outreach.approach_plan(task_id, ids, picks=picks)
+        return {
+            "steps": [asdict(step) for step in plan.steps],
+            "voters_total": plan.voters_total,
+            "candidates_considered": plan.candidates_considered,
+            "pool_size": len(ids),
+            "bounded": plan.bounded or len(ids) >= pool_size,
+            "warnings": plan.warnings,
+            "filters": f.as_dict,
+        }
+
+    @app.get("/api/tasks/{task_id}/accounts/{account_id}/affinity")
+    async def affinity(
+        task_id: str,
+        account_id: str,
+        outreach: Outreach,
+        limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    ) -> dict[str, Any]:
+        """Accounts followed by the same people far more often than chance would give."""
+
+        peers = await outreach.affinity(task_id, account_id, limit=limit)
+        return {"account_id": account_id, "peers": [asdict(peer) for peer in peers]}
+
+    @app.get("/api/tasks/{task_id}/accounts/{account_id}/introductions")
+    async def introductions(
+        task_id: str,
+        account_id: str,
+        outreach: Outreach,
+        limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 100,
+    ) -> dict[str, Any]:
+        """Accounts in this task that follow the target and can be messaged."""
+
+        return await outreach.introductions(task_id, account_id, limit=limit)
 
     @app.get("/api/tasks/{task_id}/relationships")
     async def relationships(

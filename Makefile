@@ -58,7 +58,8 @@ test-enrichment:
 # writes, including the rule that no route may expose scraper identities.
 test-api:
 	@XGRAPH_TEST_DATABASE_URL=$${XGRAPH_TEST_DATABASE_URL:-postgresql://postgres:postgres@127.0.0.1:5432/xgraph_test} \
-		uv run pytest -q tests/xgraph/test_phase6_integration.py
+		uv run pytest -q tests/xgraph/test_phase6_integration.py \
+			tests/xgraph/test_outreach_integration.py
 
 serve:
 	@XGRAPH_DATABASE_URL=$${XGRAPH_DATABASE_URL:?set XGRAPH_DATABASE_URL} \
